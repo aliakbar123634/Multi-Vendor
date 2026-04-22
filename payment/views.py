@@ -12,11 +12,13 @@ from order.models import Order
 from vendor.models import VendorProfile
 from .models import Payment, Payout
 from .permissions import IsBuyer, IsVendor
-
+from notification.tasks import send_payment_success_email, send_vendor_order_notification
+from django.views.decorators.csrf import csrf_exempt
+from django.utils.decorators import method_decorator
 stripe.api_key = settings.STRIPE_SECRET_KEY
 
 class CreatePaymentIntentAPIView(APIView):
- #   permission_classes = [IsAuthenticated,IsBuyer]
+    permission_classes = [IsAuthenticated,IsBuyer]
     def post(self, request):
         user = request.user
         order_id = request.data.get("order_id")
@@ -53,9 +55,11 @@ class CreatePaymentIntentAPIView(APIView):
         
 
 
+
+@method_decorator(csrf_exempt, name='dispatch')
 class StripeWebhookAPIView(APIView):
-    # authentication_classes = []
-    # permission_classes = []
+    authentication_classes = []
+    permission_classes = []
     def post(self, request):
         payload = request.body
         sig_header = request.META.get("HTTP_STRIPE_SIGNATURE")
@@ -79,6 +83,23 @@ class StripeWebhookAPIView(APIView):
                     order.payment_status = "success"
                     order.status = "paid"
                     order.save()
+                    
+                    # Send email notifications via Celery
+                    user_id = order.user.id
+                    amount = str(order.total_amount)
+                    
+                    # Send payment confirmation to buyer
+                    send_payment_success_email.delay(order_id, user_id, amount)
+                    
+                    # Notify vendors about new order
+                    for item in order.items.all():
+                        vendor = item.product.vendor
+                        if vendor.user.email:
+                            send_vendor_order_notification.delay(
+                                vendor.user.id,
+                                order_id,
+                                item.product.name
+                            )
             except Exception:
                 pass
         elif event["type"] == "payment_intent.payment_failed":
@@ -91,3 +112,7 @@ class StripeWebhookAPIView(APIView):
             except Payment.DoesNotExist:
                 pass
         return HttpResponse(status=200)        
+
+
+
+#    python manage.py runserver        
